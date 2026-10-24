@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realtime AI Assistant</title>
+</head>
+<body>
+  <h2>Realtime AI Assistant</h2>
+
+  <button id="start">Start Conversation</button>
+  <button id="stop" disabled>Stop Conversation</button>
+
+  <p id="status">Disconnected</p>
+
+  <video
+    id="webcam"
+    autoplay
+    muted
+    playsinline
+    width="400"
+  ></video>
+
+  <canvas id="canvas" hidden></canvas>
+
+  <h3>Conversation</h3>
+  <div id="conversation"></div>
+
+  <audio id="remoteAudio" autoplay></audio>
+
+  <script>
+    const startButton = document.getElementById("start");
+    const stopButton = document.getElementById("stop");
+    const status = document.getElementById("status");
+    const webcam = document.getElementById("webcam");
+    const canvas = document.getElementById("canvas");
+    const remoteAudio = document.getElementById("remoteAudio");
+    const conversation = document.getElementById("conversation");
+
+    let peerConnection;
+    let dataChannel;
+    let mediaStream;
+    let frameTimer;
+
+    function setStatus(message) {
+      status.textContent = message;
+    }
+
+    function logMessage(message) {
+      const p = document.createElement("p");
+      p.textContent = message;
+      conversation.appendChild(p);
+    }
+
+    function sendEvent(event) {
+      if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify(event));
+      }
+    }
+
+    async function startConversation() {
+      startButton.disabled = true;
+
+      try {
+        setStatus("Requesting camera and microphone...");
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          }
+        });
+
+        webcam.srcObject = mediaStream;
+        await webcam.play();
+        setStatus("Creating AI session...");
+
+        const tokenResponse = await fetch("/api/client-secret", {
+          method: "POST"
+        });
+
+        if (!tokenResponse.ok) {
+          throw new Error(
+            "Could not create API session: " +
+            await tokenResponse.text()
+          );
+        }
+
+        const tokenData = await tokenResponse.json();
+        const ephemeralKey = tokenData.value;
+
+        if (!ephemeralKey) {
+          throw new Error("The server did not return a client secret.");
+        }
+
+        peerConnection = new RTCPeerConnection();
+
+        peerConnection.ontrack = async (event) => {
+          remoteAudio.srcObject = event.streams[0];
+
+          try {
+            await remoteAudio.play();
+          } catch (error) {
+            console.warn("Audio playback requires browser interaction.", error);
+          }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          setStatus("WebRTC: " + peerConnection.connectionState);
+        };
+
+        const audioTrack = mediaStream.getAudioTracks()[0];
+
+        peerConnection.addTrack(audioTrack, mediaStream);
+
+        dataChannel = peerConnection.createDataChannel("oai-events");
+
+        dataChannel.onopen = () => {
+          setStatus("Connected. Start speaking!");
+
+          frameTimer = setInterval(sendWebcamFrame, 5000);
+        };
+
+        dataChannel.onmessage = (event) => {
+          let message;
+
+          try {
+            message = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+
+          if (message.type === "error") {
+            console.error("Realtime API error:", message);
+            logMessage("API error: " +
+              (message.error?.message || "Unknown error"));
+          }
+
+          if (message.type === "conversation.item.input_audio_transcription.completed") {
+            logMessage("You: " + message.transcript);
+          }
+
+          if (message.type === "response.output_audio_transcript.done") {
+            logMessage("AI: " + message.transcript);
+          }
+
+          if (message.type === "response.output_text.done") {
+            logMessage("AI: " + message.text);
+          }
+        };
+
+        const offer = await peerConnection.createOffer();
+
+        await peerConnection.setLocalDescription(offer);
+
+        const response = await fetch(
+          "https://api.openai.com/v1/realtime/calls",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${ephemeralKey}`,
+              "Content-Type": "application/sdp"
+            },
+            body: offer.sdp
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            "WebRTC connection failed: " +
+            await response.text()
+          );
+        }
+
+        const answerSdp = await response.text();
+
+        await peerConnection.setRemoteDescription({
+          type: "answer",
+          sdp: answerSdp
+        });
+
+        stopButton.disabled = false;
+
+      } catch (error) {
+        console.error(error);
+        setStatus("Error: " + error.message);
+        await stopConversation();
+      }
+    }
+
+    function sendWebcamFrame() {
+      if (
+        !webcam.videoWidth ||
+        !webcam.videoHeight ||
+        dataChannel?.readyState !== "open"
+      ) {
+        return;
+      }
+
+      const maxWidth = 512;
+      const scale = Math.min(1, maxWidth / webcam.videoWidth);
+
+      canvas.width = Math.round(webcam.videoWidth * scale);
+      canvas.height = Math.round(webcam.videoHeight * scale);
+
+      const context = canvas.getContext("2d");
+
+      context.drawImage(
+        webcam,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+      );
+
+      const imageUrl = canvas.toDataURL("image/jpeg", 0.6);
+
+      sendEvent({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "Use this recent webcam frame as visual context for our conversation. Do not respond to the frame alone."
+            },
+            {
+              type: "input_image",
+              image_url: imageUrl,
+              detail: "low"
+            }
+          ]
+        }
+      });
+    }
+
+    async function stopConversation() {
+      clearInterval(frameTimer);
+
+      if (dataChannel) {
+        dataChannel.close();
+        dataChannel = null;
+      }
+
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      webcam.srcObject = null;
+      remoteAudio.srcObject = null;
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+
+      setStatus("Disconnected");
+    }
+
+    startButton.addEventListener("click", startConversation);
+    stopButton.addEventListener("click", stopConversation);
+  </script>
+</body>
+</html>
